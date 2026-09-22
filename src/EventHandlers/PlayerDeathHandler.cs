@@ -4,7 +4,6 @@ using SwiftlyS2.Shared.GameEventDefinitions;
 using SwiftlyS2.Shared.Misc;
 using SwiftlyS2.Shared.Players;
 using System;
-using System.Linq;
 
 namespace QuakeSounds;
 
@@ -38,12 +37,7 @@ public partial class QuakeSounds
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerDeath(EventPlayerDeath @event)
     {
-        if (!IsPluginEnabled())
-        {
-            return HookResult.Continue;
-        }
-
-        if (IsWarmupBlockedByConfig())
+        if (!IsPluginEnabled() || IsWarmupBlockedByConfig())
         {
             return HookResult.Continue;
         }
@@ -61,21 +55,18 @@ public partial class QuakeSounds
 
         if (attacker.PlayerID <= 0 && attackerSteamId != 0)
         {
-            var resolvedAttacker = Core.PlayerManager.GetAllPlayers()
-                .FirstOrDefault(p => p is { IsValid: true } && !p.IsFakeClient && p.SteamID == attackerSteamId && p.PlayerID > 0);
-
-            if (resolvedAttacker is not null)
+            foreach (var p in Core.PlayerManager.GetAllPlayers())
             {
-                attacker = resolvedAttacker;
+                if (p is { IsValid: true } && !p.IsFakeClient && p.SteamID == attackerSteamId && p.PlayerID > 0)
+                {
+                    attacker = p;
+                    break;
+                }
             }
         }
 
         if (attacker.PlayerID <= 0)
         {
-            if (_config.Debug)
-            {
-                Core.Logger.LogWarning("[QuakeSounds] Skipping death event due to unresolved attacker PlayerID. SteamID={SteamID}", attackerSteamId);
-            }
             return HookResult.Continue;
         }
 
@@ -106,28 +97,14 @@ public partial class QuakeSounds
 
             if (@event.Weapon.Contains("knife", StringComparison.OrdinalIgnoreCase))
             {
-                if (TryPlay(attacker, "knife_kill"))
-                {
-                    return HookResult.Continue;
-                }
-
-                if (TryPlay(attacker, "humiliation"))
+                if (TryPlay(attacker, "knife_kill") || TryPlay(attacker, "humiliation"))
                 {
                     return HookResult.Continue;
                 }
             }
 
-            if (@event.Headshot)
-            {
-                bool playedHeadshot = TryPlay(attacker, "headshot");
-                if (playedHeadshot) return HookResult.Continue;
-            }
-
-            if (@event.NoScope)
-            {
-                bool playedNoScope = TryPlay(attacker, "noscope");
-                if (playedNoScope) return HookResult.Continue;
-            }
+            if (@event.Headshot && TryPlay(attacker, "headshot")) return HookResult.Continue;
+            if (@event.NoScope && TryPlay(attacker, "noscope")) return HookResult.Continue;
         }
 
         if (!_gameStateService.FirstBloodDone && victim is { IsValid: true } && victim.PlayerID != attacker.PlayerID)
@@ -148,12 +125,7 @@ public partial class QuakeSounds
 
             if (@event.Weapon.Contains("knife", StringComparison.OrdinalIgnoreCase))
             {
-                if (TryPlay(attacker, "knife_kill"))
-                {
-                    return HookResult.Continue;
-                }
-
-                if (TryPlay(attacker, "humiliation"))
+                if (TryPlay(attacker, "knife_kill") || TryPlay(attacker, "humiliation"))
                 {
                     return HookResult.Continue;
                 }
@@ -162,39 +134,21 @@ public partial class QuakeSounds
 
         if (killCount >= 6)
         {
-            if (TryPlayKillStreak(attacker, killCount))
-            {
-                return HookResult.Continue;
-            }
+            if (TryPlayKillStreak(attacker, killCount)) return HookResult.Continue;
         }
         else if (isMultiKill && multiKillCount >= 2 && multiKillCount <= 5)
         {
-            if (TryPlayKillStreak(attacker, multiKillCount))
-            {
-                return HookResult.Continue;
-            }
+            if (TryPlayKillStreak(attacker, multiKillCount)) return HookResult.Continue;
         }
         else if (killCount >= 2)
         {
-            if (TryPlayKillStreak(attacker, killCount))
-            {
-                return HookResult.Continue;
-            }
+            if (TryPlayKillStreak(attacker, killCount)) return HookResult.Continue;
         }
-        
+
         if (!_config.PrioritizeSpecialKills)
         {
-            if (@event.Headshot)
-            {
-                bool playedHeadshot = TryPlay(attacker, "headshot");
-                if (playedHeadshot) return HookResult.Continue;
-            }
-
-            if (@event.NoScope)
-            {
-                bool playedNoScope = TryPlay(attacker, "noscope");
-                if (playedNoScope) return HookResult.Continue;
-            }
+            if (@event.Headshot && TryPlay(attacker, "headshot")) return HookResult.Continue;
+            if (@event.NoScope && TryPlay(attacker, "noscope")) return HookResult.Continue;
         }
 
         if (@event.Weapon.Contains("hegrenade", StringComparison.OrdinalIgnoreCase) && TryPlay(attacker, "perfect"))
@@ -218,41 +172,25 @@ public partial class QuakeSounds
 
     private bool TryPlay(IPlayer attacker, string soundKey)
     {
-        if (!IsPluginEnabled())
-        {
-            return false;
-        }
+        if (!IsPluginEnabled() || IsWarmupBlockedByConfig()) return false;
 
-        if (IsWarmupBlockedByConfig())
-        {
-            return false;
-        }
-
-        // Try to play sound
         var played = _soundService?.TryPlay(
-          attacker,
-          soundKey,
-          _config,
-          id => _gameStateService.IsPlayerEnabled(id),
-          id => _gameStateService.GetPlayerVolume(id)
+            attacker,
+            soundKey,
+            _config,
+            id => _gameStateService.IsPlayerEnabled(id),
+            id => _gameStateService.GetPlayerVolume(id)
         ) ?? false;
 
         if (_config.Sounds.ContainsKey(soundKey) && (_config.EnableChatMessage || _config.EnableCenterMessage))
         {
             if (_config.PlayToAll)
             {
-                var players = Core.PlayerManager.GetAllPlayers()
-                    .Where(p => p is { IsValid: true } && !p.IsFakeClient)
-                    .Where(p => _gameStateService.IsPlayerEnabled(p.SteamID));
-
-                _messageService.PrintMessageToAll(players, attacker, soundKey, _config);
+                _messageService.PrintMessageToAll(Core.PlayerManager.GetAllPlayers(), attacker, soundKey, _config);
             }
-            else
+            else if (_gameStateService.IsPlayerEnabled(attacker.SteamID))
             {
-                if (_gameStateService.IsPlayerEnabled(attacker.SteamID))
-                {
-                    _messageService.PrintMessage(attacker, attacker, soundKey, _config);
-                }
+                _messageService.PrintMessage(attacker, attacker, soundKey, _config);
             }
         }
 
@@ -261,26 +199,19 @@ public partial class QuakeSounds
 
     private bool TryPlayKillStreak(IPlayer attacker, int killCount)
     {
-        if (_config.KillStreakAnnounces.TryGetValue(killCount, out var soundKey))
+        if (_config.KillStreakAnnounces.TryGetValue(killCount, out var soundKey) && _config.Sounds.ContainsKey(soundKey))
         {
-            if (_config.Sounds.ContainsKey(soundKey))
-            {
-                TryPlay(attacker, soundKey);
-                return true;
-            }
+            return TryPlay(attacker, soundKey);
         }
         return false;
     }
 
     private static string NormalizeWeaponKey(string weapon)
     {
-        if (string.IsNullOrWhiteSpace(weapon))
-        {
-            return "weapon_unknown";
-        }
+        if (string.IsNullOrWhiteSpace(weapon)) return "weapon_unknown";
 
         return weapon.StartsWith("weapon_", StringComparison.OrdinalIgnoreCase)
-          ? weapon.ToLowerInvariant()
-          : $"weapon_{weapon.ToLowerInvariant()}";
+            ? weapon.ToLowerInvariant()
+            : $"weapon_{weapon.ToLowerInvariant()}";
     }
 }
