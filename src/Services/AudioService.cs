@@ -4,7 +4,7 @@ using SwiftlyS2.Shared.Players;
 using System;
 using System.Collections.Concurrent;
 using System.IO;
-using System.Linq;
+using System.Reflection;
 
 namespace QuakeSounds.Services;
 
@@ -13,6 +13,7 @@ public class AudioService : ISoundService
     private readonly ISwiftlyCore _core;
     private readonly dynamic _audioApi;
     private readonly ConcurrentDictionary<string, object> _decodedSources = new();
+    private static readonly ConcurrentDictionary<Type, MethodInfo?> _setSourceMethodCache = new();
     private int _channelCounter = 0;
 
     private AudioService(ISwiftlyCore core, dynamic audioApi)
@@ -32,46 +33,17 @@ public class AudioService : ISoundService
         _channelCounter = 0;
     }
 
-    public void RemovePlayerChannel(int playerId)
-    {
-    }
+    public void RemovePlayerChannel(int playerId) { }
 
     public bool TryPlay(IPlayer attacker, string soundKey, QuakeSounds.QuakeSoundsConfig config, Func<ulong, bool> isPlayerEnabled, Func<ulong, float> getPlayerVolume)
     {
-        float GetEffectiveVolume(ulong steamId)
-        {
-            var volume = config.Volume;
-            var overrideVolume = getPlayerVolume(steamId);
-            if (overrideVolume >= 0) volume = overrideVolume;
-            return Math.Clamp(volume, 0f, 1f);
-        }
-
-        if (_audioApi == null)
-        {
-            _core.Logger.LogWarning("[QuakeSounds] Audio API missing, cannot play sound.");
-            return false;
-        }
+        if (_audioApi == null) return false;
 
         if (!config.Sounds.TryGetValue(soundKey, out var configuredPath) || string.IsNullOrWhiteSpace(configuredPath))
-        {
-            if (config.Debug)
-            {
-                _core.Logger.LogWarning("[QuakeSounds] Sound key '{Key}' is not mapped in config.", soundKey);
-            }
             return false;
-        }
 
         var resolvedPath = ResolvePath(configuredPath);
-
-        if (config.Debug)
-        {
-            _core.Logger.LogInformation("[QuakeSounds] TryPlay soundKey={Key} configuredPath={ConfiguredPath} resolvedPath={ResolvedPath} playToAll={PlayToAll}", soundKey, configuredPath, resolvedPath, config.PlayToAll);
-        }
-
-        if (!File.Exists(resolvedPath))
-        {
-            return false;
-        }
+        if (!File.Exists(resolvedPath)) return false;
 
         object source;
         try
@@ -89,9 +61,11 @@ public class AudioService : ISoundService
 
         try
         {
-            // Avoid RuntimeBinderException by invoking SetSource with the actual runtime type.
-            // This also makes AudioApi type mismatches (multiple assemblies) easier to diagnose.
-            var setSource = ((object)channel).GetType().GetMethod("SetSource");
+            var channelType = ((object)channel).GetType();
+            
+            // Reflexiós Metódus gyorsítótárazása (Cache) -> megszünteti a mikro-akadásokat
+            var setSource = _setSourceMethodCache.GetOrAdd(channelType, t => t.GetMethod("SetSource"));
+
             if (setSource == null)
             {
                 _core.Logger.LogWarning("[QuakeSounds] Audio channel does not have SetSource method.");
@@ -102,67 +76,51 @@ public class AudioService : ISoundService
         }
         catch (Exception ex)
         {
-            var channelType = ((object)channel).GetType();
-            var sourceType = source?.GetType();
-            _core.Logger.LogError(ex,
-                "[QuakeSounds] Failed to SetSource on audio channel. ChannelType={ChannelType} SourceType={SourceType} SourceAssembly={SourceAssembly}",
-                channelType.FullName,
-                sourceType?.FullName ?? "NULL",
-                sourceType?.Assembly.FullName ?? "NULL");
+            _core.Logger.LogError(ex, "[QuakeSounds] Failed to SetSource on audio channel.");
             return false;
         }
 
         if (config.PlayToAll)
         {
             var anyPlayed = false;
-            foreach (var player in _core.PlayerManager.GetAllPlayers().Where(p => p is { IsValid: true } && !p.IsFakeClient && p.PlayerID > 0))
+            foreach (var player in _core.PlayerManager.GetAllPlayers())
             {
-                if (!isPlayerEnabled(player.SteamID))
-                {
+                if (player?.IsValid != true || player.IsFakeClient || player.PlayerID <= 0)
                     continue;
-                }
 
-                var volume = GetEffectiveVolume(player.SteamID);
+                if (!isPlayerEnabled(player.SteamID))
+                    continue;
+
+                var volume = config.Volume;
+                var overrideVolume = getPlayerVolume(player.SteamID);
+                if (overrideVolume >= 0) volume = overrideVolume;
+                volume = Math.Clamp(volume, 0f, 1f);
 
                 try
                 {
-                    if (config.Debug)
-                    {
-                        _core.Logger.LogInformation("[QuakeSounds] Audio PlayToAll -> PlayerID={PlayerID} SteamID={SteamID} Volume={Volume}", player.PlayerID, player.SteamID, volume);
-                    }
-
                     channel.SetVolume(player.PlayerID, volume);
                     channel.Play(player.PlayerID);
                     anyPlayed = true;
                 }
                 catch (Exception ex)
                 {
-                    _core.Logger.LogError(ex, "[QuakeSounds] Audio failed for player. PlayerID={PlayerID} SteamID={SteamID} soundKey={Key}", player.PlayerID, player.SteamID, soundKey);
+                    _core.Logger.LogError(ex, "[QuakeSounds] Audio failed for player. PlayerID={PlayerID}", player.PlayerID);
                 }
             }
             return anyPlayed;
         }
 
-        if (!isPlayerEnabled(attacker.SteamID))
-        {
-            return false;
-        }
+        if (!isPlayerEnabled(attacker.SteamID)) return false;
 
-        var attackerVolume = GetEffectiveVolume(attacker.SteamID);
+        var attackerVolume = config.Volume;
+        var overrideAttackerVol = getPlayerVolume(attacker.SteamID);
+        if (overrideAttackerVol >= 0) attackerVolume = overrideAttackerVol;
+        attackerVolume = Math.Clamp(attackerVolume, 0f, 1f);
+
         try
         {
             var attackerPlayerId = ResolvePlayerId(attacker);
-
-            if (config.Debug)
-            {
-                _core.Logger.LogInformation("[QuakeSounds] Audio Play -> PlayerID={PlayerID} SteamID={SteamID} Volume={Volume} soundKey={Key}", attackerPlayerId, attacker.SteamID, attackerVolume, soundKey);
-            }
-
-            if (attackerPlayerId <= 0)
-            {
-                _core.Logger.LogWarning("[QuakeSounds] Audio Play skipped due to invalid PlayerID. PlayerID={PlayerID} SteamID={SteamID} soundKey={Key}", attackerPlayerId, attacker.SteamID, soundKey);
-                return false;
-            }
+            if (attackerPlayerId <= 0) return false;
 
             channel.SetVolume(attackerPlayerId, attackerVolume);
             channel.Play(attackerPlayerId);
@@ -170,7 +128,7 @@ public class AudioService : ISoundService
         }
         catch (Exception ex)
         {
-            _core.Logger.LogError(ex, "[QuakeSounds] Audio failed for attacker. PlayerID={PlayerID} SteamID={SteamID} soundKey={Key}", attacker.PlayerID, attacker.SteamID, soundKey);
+            _core.Logger.LogError(ex, "[QuakeSounds] Audio failed for attacker. PlayerID={PlayerID}", attacker.PlayerID);
             return false;
         }
     }
@@ -192,15 +150,16 @@ public class AudioService : ISoundService
             return player.PlayerID;
         }
 
-        if (player.SteamID == 0)
+        if (player.SteamID == 0) return 0;
+
+        foreach (var p in _core.PlayerManager.GetAllPlayers())
         {
-            return 0;
+            if (p is { IsValid: true } && !p.IsFakeClient && p.SteamID == player.SteamID && p.PlayerID > 0)
+            {
+                return p.PlayerID;
+            }
         }
 
-        var resolvedPlayer = _core.PlayerManager
-            .GetAllPlayers()
-            .FirstOrDefault(p => p is { IsValid: true } && !p.IsFakeClient && p.SteamID == player.SteamID && p.PlayerID > 0);
-
-        return resolvedPlayer?.PlayerID ?? 0;
+        return 0;
     }
 }
